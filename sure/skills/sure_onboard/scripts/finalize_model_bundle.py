@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from sure.runtime.bundle_content import is_excluded, iter_bundle_files
+
 from deployment_contract import (
     normalize_harness_runtime,
     read_json,
@@ -170,9 +174,21 @@ def update_manifest(model_dir: Path, resolved: dict[str, Any]) -> dict[str, Any]
         *(f"artifacts/{name}" for name in DELIVERY_ARTIFACTS),
         "artifacts/artifact_manifest.json",
         "artifacts/deployment_ready.json",
+        "artifacts/sample_outputs.jsonl",
     }
     for key, entry in list(required.items()):
-        if isinstance(entry, dict) and entry.get("path") in generated_paths:
+        if isinstance(entry, dict) and (
+            entry.get("path") in generated_paths
+            or str(entry.get("path") or "").startswith("artifacts/outputs/")
+            or (
+                key == f"file:{entry.get('path')}"
+                and entry.get("description") in {
+                    f"Model weight file: {entry.get('path')}.",
+                    f"Bounded smoke fixture file: {entry.get('path')}.",
+                }
+                and is_excluded(Path(str(entry.get("path") or "")))
+            )
+        ):
             required.pop(key)
     delivery_required = (
         DELIVERY_ARTIFACTS
@@ -208,8 +224,25 @@ def update_manifest(model_dir: Path, resolved: dict[str, Any]) -> dict[str, Any]
             "path": "artifacts/sample_output.json",
             "description": "Bounded inference sample output.",
         }
+    structured_samples = model_dir / "artifacts" / "sample_outputs.jsonl"
+    if structured_samples.is_file():
+        required["sample_outputs_jsonl"] = {
+            "path": "artifacts/sample_outputs.jsonl",
+            "description": "Bounded inference sample records.",
+        }
+    outputs_dir = model_dir / "artifacts" / "outputs"
+    if outputs_dir.is_dir():
+        for output in sorted(outputs_dir.rglob("*")):
+            if output.is_symlink():
+                raise ValueError(f"generated output must not be a symlink: {output}")
+            if output.is_file() and not is_excluded(output.relative_to(model_dir)):
+                relative = output.relative_to(model_dir).as_posix()
+                required[f"file:{relative}"] = {
+                    "path": relative,
+                    "description": f"Generated validation output: {relative}.",
+                }
     fixture_root = model_dir / "fixture"
-    fixture_files = sorted(path for path in fixture_root.rglob("*") if path.is_file()) if fixture_root.is_dir() else []
+    fixture_files = iter_bundle_files(fixture_root, bundle_root=model_dir) if fixture_root.is_dir() else []
     if ready_profile and not any(path.name == "gt.jsonl" for path in fixture_files):
         raise ValueError("ready local bundle is missing fixture ground truth")
     if fixture_root.is_dir():
@@ -225,11 +258,7 @@ def update_manifest(model_dir: Path, resolved: dict[str, Any]) -> dict[str, Any]
         weights_manifest = read_json(weights_manifest_path)
         weights_root = resolve_weights_root(model_dir, weights_manifest)
         if weights_root is not None:
-            weight_files = (
-                [weights_root]
-                if weights_root.is_file()
-                else sorted(weight_path for weight_path in weights_root.rglob("*") if weight_path.is_file())
-            )
+            weight_files = iter_bundle_files(weights_root, bundle_root=model_dir)
             if weights_manifest.get("required") is True and not weight_files:
                 raise ValueError(f"required weights root contains no files: {weights_root}")
             for weight_path in weight_files:
@@ -281,6 +310,8 @@ def build_deployment_ready(run_dir: Path, model_dir: Path, resolved: dict[str, A
         relative = Path(raw_path)
         if not raw_path or relative.is_absolute() or ".." in relative.parts:
             raise ValueError(f"finalized artifact path is not portable: {raw_path}")
+        if is_excluded(relative):
+            raise ValueError(f"finalized required artifact is excluded from bundle content: {raw_path}")
         if relative.as_posix() == "artifacts/deployment_ready.json":
             continue
         path = (model_dir / relative).resolve()
@@ -376,23 +407,97 @@ def portable_path(raw: str, run_dir: Path, model_dir: Path) -> str:
     return raw
 
 
-def normalize_portable_paths(value: Any, run_dir: Path, model_dir: Path, key: str = "") -> Any:
+def normalize_portable_paths(value: Any, run_dir: Path, model_dir: Path) -> Any:
     if isinstance(value, dict):
         return {
-            name: normalize_portable_paths(child, run_dir, model_dir, name)
+            name: normalize_portable_paths(child, run_dir, model_dir)
             for name, child in value.items()
         }
     if isinstance(value, list):
-        return [normalize_portable_paths(child, run_dir, model_dir, key) for child in value]
-    if isinstance(value, str) and (key == "path" or key.endswith("_path")) and Path(value).is_absolute():
+        return [normalize_portable_paths(child, run_dir, model_dir) for child in value]
+    if isinstance(value, str) and Path(value).is_absolute():
         return portable_path(value, run_dir, model_dir)
     return value
+
+
+def normalize_generated_samples(run_dir: Path, model_dir: Path) -> None:
+    for name in ("sample_output.json", "sample_outputs.jsonl", "weights_manifest.json"):
+        source = model_dir / "artifacts" / name
+        if not source.is_file():
+            continue
+        if name.endswith(".jsonl"):
+            rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+            content = "".join(
+                json.dumps(normalize_portable_paths(row, run_dir, model_dir), ensure_ascii=False, sort_keys=True) + "\n"
+                for row in rows
+            ).encode("utf-8")
+        else:
+            content = json_bytes(normalize_portable_paths(read_json(source), run_dir, model_dir))
+        atomic_write(source, content)
+        run_copy = run_dir / "artifacts" / name
+        if run_copy.is_file():
+            atomic_write(run_copy, content)
+
+
+def finish_manifest(
+    run_dir: Path, resolved: dict[str, Any], deployment: dict[str, Any], produces: Path
+) -> dict[str, Any]:
+    """Write the run-level sure_finish manifest envelope deterministically.
+
+    sure_finish validates this envelope (schema_version/run_id/skill_name/
+    status/created_at/inputs/outputs/validation) against the run record, a
+    contract the onboard skill never materialized — the agent had to improvise
+    the file and could not satisfy it together with the deployment_ready
+    schema. The values come from run.json and the final artifacts; no
+    model-specific knowledge.
+    """
+    run_record = read_json(run_dir / "run.json")
+    run_id = run_record.get("runId")
+    skill_name = run_record.get("skillName")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("run.json must declare runId before the finish manifest can be written.")
+    if not isinstance(skill_name, str) or not skill_name.strip():
+        raise ValueError("run.json must declare skillName before the finish manifest can be written.")
+    output = produces.resolve()
+    if not output.is_relative_to(run_dir.resolve()) or not output.is_file():
+        raise ValueError("deployment_ready output must exist inside the run directory")
+    inputs = {
+        key: str(resolved[key])
+        for key in ("model_id", "task_type", "model_input_path", "device", "package_profile")
+        if resolved.get(key) is not None
+    }
+    outputs = {
+        key: value
+        for key, value in deployment.items()
+        if isinstance(value, str)
+        and value.startswith("artifacts/")
+        and (run_dir / value).is_file()
+    }
+    outputs["deployment_ready"] = output.relative_to(run_dir.resolve()).as_posix()
+    manifest = {
+        "schema_version": "sure.onboard.finish_manifest.v1",
+        "run_id": run_id,
+        "skill_name": skill_name,
+        "status": "success",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "inputs": inputs,
+        "outputs": outputs,
+        "validation": {
+            "model_name": str(deployment.get("model_name", "")),
+            "package_profile": str(deployment.get("package_profile", "")),
+            "deployment_status": str(deployment.get("status", "")),
+            "bundle_identity_sha256": str(deployment.get("bundle_identity_sha256", "")),
+        },
+    }
+    atomic_write(run_dir / "manifest.json", json_bytes(manifest))
+    return manifest
 
 
 def finalize(run_dir: Path, produces: Path) -> dict[str, Any]:
     model_dir, resolved = resolve_model_dir(run_dir)
     ensure_safe_bundle_targets(model_dir, resolved)
     copy_selected_delivery_artifacts(run_dir, model_dir, resolved)
+    normalize_generated_samples(run_dir, model_dir)
     update_manifest(model_dir, resolved)
     package = write_package_gate(run_dir, run_dir / "artifacts" / "package_gate.json", model_dir)
     package["model_dir"] = "."
@@ -407,6 +512,7 @@ def finalize(run_dir: Path, produces: Path) -> dict[str, Any]:
     content = json_bytes(deployment)
     atomic_write(model_dir / "artifacts" / "deployment_ready.json", content)
     atomic_write(produces, content)
+    finish_manifest(run_dir, resolved, deployment, produces)
     return deployment
 
 

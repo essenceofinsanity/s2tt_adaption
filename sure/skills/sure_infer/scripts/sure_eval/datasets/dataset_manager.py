@@ -200,7 +200,7 @@ class DatasetManager:
     Handles SURE Benchmark datasets and standard HuggingFace/ModelScope datasets.
     """
     
-    def __init__(self, config: Config | None = None, dataset_source_key: str = "default") -> None:
+    def __init__(self, config: Config | None = None, dataset_source_key: str = "") -> None:
         self.config = config or Config.from_env()
         self.dataset_source_key = dataset_source_key
         self.data_dir = Path(self.config.data.datasets)
@@ -222,6 +222,29 @@ class DatasetManager:
     def source_projection_name(self, dataset_id: str, task: str | None) -> str:
         """JSONL stem for a ds_pool source-root projection, cached per task."""
         return f"{dataset_id}__{self._task_slug(task)}"
+
+    def assert_source_projection(self, path: Path, ref: DatasetSourceRef) -> None:
+        """Refuse a cached projection whose canonical name belongs to another source."""
+        if not path.exists():
+            return
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                row = next((json.loads(line) for line in handle if line.strip()), {})
+            metadata = row.get("metadata") if isinstance(row, dict) else None
+            cached_root = metadata.get("source_dataset_root") if isinstance(metadata, dict) else None
+            cached_version = metadata.get("version_id") if isinstance(metadata, dict) else None
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cached source projection is unreadable: {path}: {exc}") from exc
+        if (
+            not isinstance(cached_root, str)
+            or Path(cached_root).resolve() != Path(ref.source_root).resolve()
+            or cached_version != ref.version_id
+        ):
+            raise ValueError(
+                f"cached projection {path} belongs to source {cached_root or '(unknown)'} "
+                f"version {cached_version or '(unknown)'}, not requested source {ref.source_root} "
+                f"version {ref.version_id}; use a distinct datasets_root or source name/version"
+            )
 
     def get_jsonl_path(self, dataset_name: str) -> Path:
         """Get the JSONL file path for a dataset.
@@ -703,6 +726,70 @@ class DatasetManager:
                 rows.append(row)
         return rows, skipped, source_records
 
+    def _project_se_sample_rows(
+        self,
+        *,
+        sample_jsonl_path: Path,
+        raw_dir: Path,
+        language: str,
+        dataset_label: str,
+        metadata_base: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+        rows: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        source_records = 0
+        with sample_jsonl_path.open("r", encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                source_records += 1
+                try:
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        raise ValueError("row is not an object")
+                    attr = record.get("attribute") if isinstance(record.get("attribute"), dict) else {}
+                    noisy_value = attr.get("path") or record.get("noisy_audio") or record.get("audio")
+                    if not isinstance(noisy_value, str) or not noisy_value.strip():
+                        raise ValueError("missing noisy audio (attribute.path or noisy_audio)")
+                    noisy_path = self._resolve_oref_audio_path(noisy_value, raw_dir)
+                    if not noisy_path.is_file():
+                        raise ValueError(f"noisy_audio_not_found: {noisy_path}")
+                    if attr.get("size") is not None and int(attr["size"]) != noisy_path.stat().st_size:
+                        raise ValueError("noisy_audio_size_mismatch")
+                    annotations = record.get("annotation")
+                    annotation = annotations[0] if isinstance(annotations, list) and annotations and isinstance(annotations[0], dict) else {}
+                    reference_value = record.get("reference_audio") or annotation.get("reference_audio")
+                    if not isinstance(reference_value, str) or not reference_value.strip():
+                        raise ValueError("missing reference_audio")
+                    reference_path = self._resolve_oref_audio_path(reference_value, raw_dir)
+                    if not reference_path.is_file():
+                        raise ValueError(f"reference_audio_not_found: {reference_path}")
+                    key = str(record.get("sample_id") or record.get("key") or noisy_path.stem)
+                    if key in seen_keys:
+                        raise ValueError(f"duplicate sample_id: {key}")
+                    seen_keys.add(key)
+                    rows.append(
+                        {
+                            "key": key,
+                            "path": str(noisy_path),
+                            "audio": str(noisy_path),
+                            "noisy_audio": str(noisy_path),
+                            "reference_audio": str(reference_path),
+                            "task": "SE",
+                            "language": str(record.get("language") or language),
+                            "dataset": dataset_label,
+                            "sample_rate": attr.get("sample_rate"),
+                            "duration_ms": attr.get("duration", 0),
+                            "metadata": {**metadata_base, "sample_id": record.get("sample_id")},
+                        }
+                    )
+                except json.JSONDecodeError as exc:
+                    skipped.append({"line": line_no, "reason": f"invalid_json: {exc.msg}"})
+                except (ValueError, TypeError) as exc:
+                    skipped.append({"line": line_no, "reason": str(exc)})
+        return rows, skipped, source_records
+
     def _copy_source_files(
         self,
         *,
@@ -737,6 +824,8 @@ class DatasetManager:
             return "s2tt_translation_v1"
         if task == "SV":
             return "sv_embeddings_v1"
+        if task == "SE":
+            return "se_enhancement_v1"
         return f"{self._task_slug(task)}_readback_v1"
 
     def _convert_source_root_to_jsonl(self, ref: DatasetSourceRef, task: str | None = None) -> Path:
@@ -754,6 +843,7 @@ class DatasetManager:
         projection_name = self.source_projection_name(ref.dataset_id, task)
         jsonl_path = self.jsonl_dir / f"{projection_name}.jsonl"
         if jsonl_path.exists():
+            self.assert_source_projection(jsonl_path, ref)
             logger.info(
                 "Using existing source-root projection",
                 dataset=projection_name,
@@ -768,9 +858,9 @@ class DatasetManager:
             raise FileNotFoundError(f"source sample.jsonl not found: {sample_jsonl_path}")
         if not raw_dir.exists():
             raise FileNotFoundError(f"source raw_dir not found: {raw_dir}")
-        # Native projectors (ASR/KWS/LID/VAD/S2TT/SV). Everything else is a
+        # Native projectors (ASR/KWS/LID/VAD/S2TT/SV/SE). Everything else is a
         # readback projection of ASR-shaped rows (text as target, audio as path).
-        native_tasks = {"ASR", "KWS", "LID", "VAD", "S2TT", "SV"}
+        native_tasks = {"ASR", "KWS", "LID", "VAD", "S2TT", "SV", "SE"}
         source_meta = read_source_metadata(ref)
         # Keep S2TT discovery when caller passed ASR default but ds declares S2TT
         # and no multi-task intent is in play — only when task is still ASR and
@@ -780,6 +870,7 @@ class DatasetManager:
             projection_name = self.source_projection_name(ref.dataset_id, task)
             jsonl_path = self.jsonl_dir / f"{projection_name}.jsonl"
             if jsonl_path.exists():
+                self.assert_source_projection(jsonl_path, ref)
                 return jsonl_path
 
         if task not in native_tasks and task not in {"TTS", "VC"}:
@@ -787,7 +878,7 @@ class DatasetManager:
             # ponytail: open-ended readback for TTS/VC only; expand if more synth tasks land.
             raise ValueError(
                 f"source-root projection for task {task!r} is not implemented; "
-                f"supported tasks: ASR, KWS, LID, VAD, S2TT, SV, TTS, VC"
+                f"supported tasks: ASR, KWS, LID, VAD, S2TT, SV, SE, TTS, VC"
             )
 
         ds_meta = self._load_single_json_object(ds_jsonl_path)
@@ -824,6 +915,14 @@ class DatasetManager:
                 sample_jsonl_path=sample_jsonl_path,
                 raw_dir=raw_dir,
                 trial_manifest=trial_manifest,
+                language=language,
+                dataset_label=projection_name,
+                metadata_base=metadata_base,
+            )
+        elif task == "SE":
+            rows, skipped, source_records = self._project_se_sample_rows(
+                sample_jsonl_path=sample_jsonl_path,
+                raw_dir=raw_dir,
                 language=language,
                 dataset_label=projection_name,
                 metadata_base=metadata_base,
@@ -906,6 +1005,16 @@ class DatasetManager:
                 "language": "row.language|ds.audio.speech.language",
                 "speaker_id": "record.speaker_id",
                 "trial_manifest": "record.trial_manifest|trial_manifest.json",
+            }
+        elif task == "SE":
+            fields = {
+                "key": "sample_id|key|attribute.path stem",
+                "path": "attribute.path|noisy_audio|audio",
+                "audio": "same as path",
+                "noisy_audio": "same as path",
+                "reference_audio": "reference_audio|annotation[0].reference_audio",
+                "task": "constant:SE",
+                "language": "row.language|ds.audio.speech.language",
             }
         else:
             fields = {
@@ -1003,6 +1112,13 @@ class DatasetManager:
                     "type": "speaker_verification",
                     "trial_manifest": "trial_manifest",
                 },
+            }
+        elif task == "SE":
+            io_contract = {
+                "task": "SE",
+                "input": {"primary_field": "path", "type": "audio_path", "role": "noisy_audio", "required_fields": ["key", "path"]},
+                "output": {"prediction_format": "tsv", "columns": ["key", "prediction_audio"], "type": "audio_path"},
+                "reference": {"primary_field": "reference_audio", "type": "audio_path"},
             }
         elif task == "ASR":
             io_contract = {
@@ -1301,7 +1417,17 @@ class DatasetManager:
         """Expand collection aliases into concrete, non-mixed dataset splits."""
         expanded: list[str] = []
         seen: set[str] = set()
+        source_by_id: dict[str, Path] = {}
         for dataset_name in dataset_names:
+            if is_source_entry(dataset_name):
+                ref = resolve_site_source_entry(dataset_name, dataset_source_key=self.dataset_source_key)
+                source = Path(ref.source_root).resolve()
+                previous = source_by_id.setdefault(ref.dataset_id, source)
+                if previous != source:
+                    raise ValueError(
+                        f"ambiguous dataset id {ref.dataset_id!r}: {previous} and {source}; "
+                        "use distinct source names or versions"
+                    )
             members = self._collection_members(dataset_name)
             if not members:
                 canonical_name = self.normalize_dataset_name(dataset_name)

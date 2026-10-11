@@ -67,11 +67,12 @@ Recommended first command after start, when a `MODEL_INPUT` path is available:
   --model-input-path sure/handoffs/<model>/model_input.yaml \
   --run-dir <run_dir> \
   --repo-root <repo_root> \
-  --package-profile docker-registry \
   [--image-version <version>]
 ```
 
 This helper emits only `model_input_resolved.json` and `context_selection.json`. For `docker-registry`, it resolves `container_delivery.target_image` from the active site policy before any model download or build; omit `--image-version` to select the next unused patch tag. It deliberately does **not** emit `backend_choice.json` or `build_plan.json`; those must remain agent-research-first outputs based on repository evidence and documented import/load/inference paths.
+
+The helper reads explicit `package`/`package_profile`, `device`, `force_repair`, and `skip_download` options from `<run_dir>/run.json`. Omit the corresponding helper flags to inherit them. If you supply a helper flag, it must agree with the run's explicit option. Without an explicit option, the existing helper defaults apply.
 
 `MODEL_INPUT` should be strict YAML. The helper includes a scalar-only fallback for legacy handoffs with unquoted multiline code snippets, but fallback output is partial and must be treated as a repair signal for `/sure_feed`, not as the preferred format.
 
@@ -289,5 +290,7 @@ Earlier runs leave agent-written notes. `sure/memory/index.md` (repo root) is th
 ## Success Criteria
 
 The `pre_finish` hook enforces that the state machine reached `finalize_model_bundle` and that `deployment_ready.json` passes its hash, portability, package, and execution-policy checks. A local model can finish successfully with either immutable registry evidence or an explicitly permitted, sealed Python Model Runtime.
+
+`finalize_model_bundle` also writes the run-level finish manifest at `.sure/runs/<run_id>/manifest.json` (envelope: `schema_version`, `run_id`, `skill_name`, `status`, `created_at`, `inputs`, `outputs`, `validation`). Call `sure_finish` with `status: "success"` and `manifest_path: ".sure/runs/<run_id>/manifest.json"` — do not point `manifest_path` at `deployment_ready.json` or hand-edit the envelope; `sure_finish` checks `run_id`, `skill_name`, and `status` against the run record. If `incomplete` or `failed`, update the manifest's `status` to match and finish with a repair summary.
 
 A `failed` or `incomplete` finish must also carry `artifacts/extraction_declaration.json` (see `sure/runtime/memory/EXTRACTION.md`, section 10): `pre_finish` returns a repair asking for it up to twice, then lets the run finish and records `extraction: failed`.

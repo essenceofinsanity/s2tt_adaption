@@ -31,8 +31,10 @@ from sure_eval.datasets.source_resolver import (
     read_source_language,
     read_source_metadata,
     read_source_task,
+    relative_source_candidates,
     resolve_site_source_entry,
     source_default_task,
+    split_source_entry,
 )
 
 from evaluation_capabilities import default_metrics_for_task_language, supported_metrics_for_task_language
@@ -552,13 +554,42 @@ def _default_metrics(task: str, language: str, engine_root: Path | None) -> list
     return _fallback_default_metrics(task, language)
 
 
+def _unresolved_dataset_error(requested_name: str, jsonl_path: Path) -> EvalInputError:
+    """Why a dataset input resolves to nothing, and what to pass instead.
+
+    Source entries are absolute paths under a configured allowed_source_roots
+    entry; anything else must already exist as a projection under the projection
+    root. A name that is neither must fail here, loudly, with the absolute path
+    the caller meant -- not degrade to an UNKNOWN-task row and fail much later
+    with an unrelated error.
+    """
+    bare, embedded_version = split_source_entry(requested_name)
+    hint = ""
+    candidates = relative_source_candidates(requested_name)
+    if candidates:
+        shown = "; ".join(f"{key} -> {path}" for key, path in candidates)
+        first_key, first_path = candidates[0]
+        suggestion = first_path + (f"@{embedded_version}" if embedded_version else "")
+        root_label = f"allowed_source_roots key '{first_key}'" if first_key else "SURE_DATASET_SOURCE_ROOT"
+        hint = (
+            f" A directory named '{Path(str(bare)).name}' exists under {root_label}: {shown}. "
+            f"Pass the absolute source directory instead: datasets={suggestion}."
+        )
+    return EvalInputError(
+        f"dataset '{requested_name}' resolves to nothing: it is not an absolute source path "
+        f"and no projection jsonl exists at '{jsonl_path}'. "
+        "Source datasets are absolute directories under one of the configured allowed_source_roots "
+        "entries, optionally suffixed @<version>." + hint
+    )
+
+
 def _dataset_details(
     manager: DatasetManager,
     names: list[str],
     requested_metrics: list[str],
     engine_root: Path | None,
     model_task: str = "",
-    dataset_source_key: str = "default",
+    dataset_source_key: str = "",
 ) -> list[dict[str, Any]]:
     expanded = manager.expand_dataset_names(names)
     details: list[dict[str, Any]] = []
@@ -581,21 +612,28 @@ def _dataset_details(
         # per-task projection happens to be cached. Re-resolve it every time so
         # a stale LID/ASR projection cannot override the current model intent.
         source_entry = is_source_entry(requested_name)
+        source_root_key: str | None = None
         if source_entry:
             ref = resolve_site_source_entry(requested_name, dataset_source_key=dataset_source_key)
             dataset_name = ref.dataset_id
-            source_root = source_root or ref.source_root
-            source_name = source_name or ref.source_dataset_name
-            version_id = version_id or ref.version_id
+            # Attribution comes from this dataset's own requested path, never from the cached
+            # metadata above: a warm projection's recorded root is not what this run asked for.
+            source_root_key = ref.source_root_key
+            source_root = ref.source_root
+            source_name = ref.source_dataset_name
+            version_id = ref.version_id
             dataset_task = _source_projection_task(model_task, requested_metrics, ref)
-            language = (read_source_language(ref) or language or "auto").lower()
+            language = (read_source_language(ref) or "auto").lower()
             source_supported_tasks = ref.supported_tasks
             jsonl_path = manager.jsonl_dir / (
                 manager.source_projection_name(ref.dataset_id, dataset_task) + ".jsonl"
             )
+            manager.assert_source_projection(jsonl_path, ref)
         task = _effective_dataset_task(dataset_task, model_task, requested_metrics)
         if not task:
             task = "UNKNOWN"
+        if not source_entry and not info and not jsonl_path.exists():
+            raise _unresolved_dataset_error(requested_name, jsonl_path)
         metrics = requested_metrics or _default_metrics(task, language, engine_root)
         detail = {
             "name": dataset_name,
@@ -619,6 +657,9 @@ def _dataset_details(
             detail["source_dataset_name"] = str(source_name)
         if version_id:
             detail["version_id"] = str(version_id)
+        if source_root_key is not None:
+            # "" when the accepted root came from a path override and so has no configured key.
+            detail["source_root_key"] = source_root_key
         if source_supported_tasks:
             detail["supported_tasks"] = list(source_supported_tasks)
         if dataset_task and dataset_task != task:
@@ -636,6 +677,8 @@ def _dataset_details(
             dataset_task = _normalize_task(info.get("task") or first_sample.get("task") or "")
             task = _effective_dataset_task(dataset_task, model_task, requested_metrics)
             language = str(info.get("language") or first_sample.get("language") or "").lower()
+            if not info and not jsonl_path.exists():
+                raise _unresolved_dataset_error(dataset_name, jsonl_path)
             detail = {
                 "name": dataset_name,
                 "requested_name": dataset_name,
@@ -853,7 +896,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--datasets-root")
     parser.add_argument("--output")
     parser.add_argument("--output-dir", default="")
-    parser.add_argument("--dataset-source-key", default="default")
+    parser.add_argument("--dataset-source-key", default="")
     return parser
 
 
